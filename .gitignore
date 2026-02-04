@@ -205,3 +205,15 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+# Ignore large clickStream CSVs
+/clickStream/item_properties_part1.csv
+/clickStream/item_properties_part2.csv
+
+
+path/to/file1
+path/to/file2
+/clickStream/item_properties_part1.csv
+/clickStream/item_properties_part2.csv
+/clickStream/item_properties_part*.csv
+/clickStream/item_properties_part*.csv
+
