@@ -3,3 +3,4 @@ path/to/file2
 /clickStream/item_properties_part1.csv
 /clickStream/item_properties_part2.csv
 /clickStream/item_properties_part*.csv
+/clickStream/item_properties_part*.csv
