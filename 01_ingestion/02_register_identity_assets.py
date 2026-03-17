@@ -9,6 +9,8 @@ from pyspark.sql import functions as F
 DEFAULT_CATALOG = "kvt_project"
 DEFAULT_BRONZE_SCHEMA = "bronze"
 DEFAULT_SOURCE_ROOT = "/Volumes/kvt_project/bronze/source_systems"
+DEFAULT_CARD_IDENTITY_COLLECTION = "01_french_id"
+DEFAULT_INCLUDE_FAKE_IDENTITY = "true"
 DEFAULT_WRITE_MODE = "overwrite"
 
 
@@ -24,17 +26,28 @@ def get_widget_value(name: str, default_value: str) -> str:
 CATALOG = get_widget_value("catalog", DEFAULT_CATALOG)
 BRONZE_SCHEMA = get_widget_value("bronze_schema", DEFAULT_BRONZE_SCHEMA)
 SOURCE_ROOT = get_widget_value("source_root", DEFAULT_SOURCE_ROOT)
+CARD_IDENTITY_COLLECTION = get_widget_value(
+    "card_identity_collection",
+    DEFAULT_CARD_IDENTITY_COLLECTION,
+)
+INCLUDE_FAKE_IDENTITY = (
+    get_widget_value("include_fake_identity", DEFAULT_INCLUDE_FAKE_IDENTITY).lower()
+    == "true"
+)
 WRITE_MODE = get_widget_value("write_mode", DEFAULT_WRITE_MODE)
 BATCH_ID = get_widget_value(
     "batch_id",
     datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ"),
 )
 BRONZE_NAMESPACE = f"{CATALOG}.{BRONZE_SCHEMA}"
+CARD_IDENTITY_DOCUMENT_COLLECTION = f"card_identity_{CARD_IDENTITY_COLLECTION}"
 
 FAKE_IDENTITY_ROOT = f"{SOURCE_ROOT}/Fake_identity"
-CARD_IDENTITY_IMAGE_ROOT = f"{SOURCE_ROOT}/card_identity/01_alb_id/images"
+CARD_IDENTITY_IMAGE_ROOT = (
+    f"{SOURCE_ROOT}/card_identity/{CARD_IDENTITY_COLLECTION}/images"
+)
 CARD_IDENTITY_ANNOTATION_ROOT = (
-    f"{SOURCE_ROOT}/card_identity/01_alb_id/ground_truth"
+    f"{SOURCE_ROOT}/card_identity/{CARD_IDENTITY_COLLECTION}/ground_truth"
 )
 
 print(
@@ -42,6 +55,8 @@ print(
         "catalog": CATALOG,
         "bronze_schema": BRONZE_SCHEMA,
         "source_root": SOURCE_ROOT,
+        "card_identity_collection": CARD_IDENTITY_COLLECTION,
+        "include_fake_identity": INCLUDE_FAKE_IDENTITY,
         "write_mode": WRITE_MODE,
         "batch_id": BATCH_ID,
         "fake_identity_root": FAKE_IDENTITY_ROOT,
@@ -54,6 +69,14 @@ print(
 spark.sql(f"CREATE SCHEMA IF NOT EXISTS {BRONZE_NAMESPACE}")
 
 # COMMAND ----------
+def path_exists(path: str) -> bool:
+    try:
+        dbutils.fs.ls(path)
+        return True
+    except Exception:
+        return False
+
+
 def add_common_file_metadata(
     df: DataFrame,
     source_system: str,
@@ -102,19 +125,15 @@ def union_all(dataframes: list[DataFrame]) -> DataFrame:
     return reduce(lambda left, right: left.unionByName(right), dataframes)
 
 # COMMAND ----------
-fake_identity_png_df = (
-    spark.read.format("binaryFile")
-    .option("recursiveFileLookup", "true")
-    .option("pathGlobFilter", "*.png")
-    .load(FAKE_IDENTITY_ROOT)
-)
+if not path_exists(CARD_IDENTITY_IMAGE_ROOT):
+    raise FileNotFoundError(
+        f"Card identity image root not found: {CARD_IDENTITY_IMAGE_ROOT}"
+    )
 
-fake_identity_jpg_df = (
-    spark.read.format("binaryFile")
-    .option("recursiveFileLookup", "true")
-    .option("pathGlobFilter", "*.jpg")
-    .load(FAKE_IDENTITY_ROOT)
-)
+if not path_exists(CARD_IDENTITY_ANNOTATION_ROOT):
+    raise FileNotFoundError(
+        f"Card identity annotation root not found: {CARD_IDENTITY_ANNOTATION_ROOT}"
+    )
 
 card_identity_tif_df = (
     spark.read.format("binaryFile")
@@ -123,8 +142,30 @@ card_identity_tif_df = (
     .load(CARD_IDENTITY_IMAGE_ROOT)
 )
 
-identity_document_files_df = union_all(
-    [
+file_dataframes = [
+    add_common_file_metadata(
+        card_identity_tif_df.select("path", "modificationTime", "length"),
+        source_system="card_identity",
+        document_collection=CARD_IDENTITY_DOCUMENT_COLLECTION,
+    )
+]
+
+if INCLUDE_FAKE_IDENTITY and path_exists(FAKE_IDENTITY_ROOT):
+    fake_identity_png_df = (
+        spark.read.format("binaryFile")
+        .option("recursiveFileLookup", "true")
+        .option("pathGlobFilter", "*.png")
+        .load(FAKE_IDENTITY_ROOT)
+    )
+
+    fake_identity_jpg_df = (
+        spark.read.format("binaryFile")
+        .option("recursiveFileLookup", "true")
+        .option("pathGlobFilter", "*.jpg")
+        .load(FAKE_IDENTITY_ROOT)
+    )
+
+    file_dataframes = [
         add_common_file_metadata(
             fake_identity_png_df.select("path", "modificationTime", "length"),
             source_system="fake_identity",
@@ -135,13 +176,10 @@ identity_document_files_df = union_all(
             source_system="fake_identity",
             document_collection="fake_identity",
         ),
-        add_common_file_metadata(
-            card_identity_tif_df.select("path", "modificationTime", "length"),
-            source_system="card_identity",
-            document_collection="card_identity_01_alb_id",
-        ),
+        *file_dataframes,
     ]
-).withColumn(
+
+identity_document_files_df = union_all(file_dataframes).withColumn(
     "asset_type",
     F.lit("document_image"),
 )
@@ -163,7 +201,7 @@ identity_document_annotations_df = (
             "content",
         ),
         source_system="card_identity",
-        document_collection="card_identity_01_alb_id",
+        document_collection=CARD_IDENTITY_DOCUMENT_COLLECTION,
     )
     .withColumn("annotation_json", F.decode("content", "UTF-8"))
     .drop("content")
