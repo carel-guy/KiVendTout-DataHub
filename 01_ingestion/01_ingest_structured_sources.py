@@ -7,12 +7,13 @@ from pyspark.sql import functions as F
 
 # COMMAND ----------
 DEFAULT_CATALOG = "kvt_project"
-DEFAULT_BRONZE_SCHEMA = "bronze"
+DEFAULT_SCHEMA = "bronze"
 DEFAULT_SOURCE_ROOT = "/Volumes/kvt_project/bronze/source_systems"
 DEFAULT_WRITE_MODE = "overwrite"
+DEFAULT_AUDIT_TABLE = "bronze_ingestion_audit"
 
 
-def get_widget_value(name: str, default_value: str) -> str:
+def get_widget(name: str, default_value: str) -> str:
     try:
         dbutils.widgets.text(name, default_value)
         value = dbutils.widgets.get(name)
@@ -21,27 +22,45 @@ def get_widget_value(name: str, default_value: str) -> str:
         return default_value
 
 
-CATALOG = get_widget_value("catalog", DEFAULT_CATALOG)
-BRONZE_SCHEMA = get_widget_value("bronze_schema", DEFAULT_BRONZE_SCHEMA)
-SOURCE_ROOT = get_widget_value("source_root", DEFAULT_SOURCE_ROOT)
-WRITE_MODE = get_widget_value("write_mode", DEFAULT_WRITE_MODE)
-BATCH_ID = get_widget_value(
+CATALOG = get_widget("catalog", DEFAULT_CATALOG)
+SCHEMA = get_widget("schema", DEFAULT_SCHEMA)
+SOURCE_ROOT = get_widget("source_root", DEFAULT_SOURCE_ROOT)
+WRITE_MODE = get_widget("write_mode", DEFAULT_WRITE_MODE)
+AUDIT_TABLE = get_widget("audit_table", DEFAULT_AUDIT_TABLE)
+BATCH_ID = get_widget(
     "batch_id",
     datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ"),
 )
-BRONZE_NAMESPACE = f"{CATALOG}.{BRONZE_SCHEMA}"
+BRONZE_NAMESPACE = f"{CATALOG}.{SCHEMA}"
+AUDIT_TABLE_NAME = f"{BRONZE_NAMESPACE}.{AUDIT_TABLE}"
 
 print(
     {
         "catalog": CATALOG,
-        "bronze_schema": BRONZE_SCHEMA,
+        "schema": SCHEMA,
         "source_root": SOURCE_ROOT,
         "write_mode": WRITE_MODE,
+        "audit_table": AUDIT_TABLE_NAME,
         "batch_id": BATCH_ID,
     }
 )
 
 # COMMAND ----------
+def path_exists(path: str) -> bool:
+    try:
+        dbutils.fs.ls(path)
+        return True
+    except Exception:
+        return False
+
+
+catalogs = [row["catalog"] for row in spark.sql("SHOW CATALOGS").collect()]
+if CATALOG not in catalogs:
+    raise ValueError(f"Catalog not found: {CATALOG}")
+
+if not path_exists(SOURCE_ROOT):
+    raise FileNotFoundError(f"Source root not found: {SOURCE_ROOT}")
+
 spark.sql(f"CREATE SCHEMA IF NOT EXISTS {BRONZE_NAMESPACE}")
 
 # COMMAND ----------
@@ -153,8 +172,18 @@ DATASETS = [
     },
 ]
 
+missing_paths = []
 for dataset in DATASETS:
-    print(dataset)
+    for source_path in dataset["source_paths"]:
+        if not path_exists(source_path):
+            missing_paths.append(source_path)
+
+if missing_paths:
+    raise FileNotFoundError(
+        "Missing source paths:\n" + "\n".join(sorted(missing_paths))
+    )
+
+print(f"{len(DATASETS)} datasets configured")
 
 # COMMAND ----------
 def strip_bom_from_column_names(df: DataFrame) -> DataFrame:
@@ -166,7 +195,7 @@ def strip_bom_from_column_names(df: DataFrame) -> DataFrame:
     return renamed_df
 
 
-def read_csv_as_raw_df(
+def read_raw_csv(
     source_path: str,
     source_system: str,
     dataset_name: str,
@@ -177,7 +206,6 @@ def read_csv_as_raw_df(
         .option("inferSchema", "false")
         .option("mode", "PERMISSIVE")
         .option("multiLine", "false")
-        .option("nullValue", "__KVT_NULL__")
         .load(source_path)
     )
 
@@ -203,14 +231,19 @@ def read_csv_as_raw_df(
 def union_all(dataframes: list[DataFrame]) -> DataFrame:
     if len(dataframes) == 1:
         return dataframes[0]
-    return reduce(lambda left, right: left.unionByName(right), dataframes)
+    return reduce(
+        lambda left, right: left.unionByName(right, allowMissingColumns=True),
+        dataframes,
+    )
 
 # COMMAND ----------
 audit_rows = []
 
 for dataset in DATASETS:
+    print(f"Processing {dataset['target_table']}")
+
     source_frames = [
-        read_csv_as_raw_df(
+        read_raw_csv(
             source_path=source_path,
             source_system=dataset["source_system"],
             dataset_name=dataset["dataset_name"],
@@ -219,6 +252,8 @@ for dataset in DATASETS:
     ]
 
     bronze_df = union_all(source_frames)
+    bronze_df.cache()
+    row_count = bronze_df.count()
     full_table_name = f"{BRONZE_NAMESPACE}.{dataset['target_table']}"
 
     (
@@ -228,16 +263,19 @@ for dataset in DATASETS:
         .saveAsTable(full_table_name)
     )
 
-    row_count = bronze_df.count()
     audit_rows.append(
         (
             dataset["target_table"],
+            dataset["source_system"],
+            dataset["dataset_name"],
             ", ".join(dataset["source_paths"]),
             row_count,
             WRITE_MODE,
             BATCH_ID,
         )
     )
+
+    bronze_df.unpersist()
     print(f"Wrote {row_count} rows to {full_table_name}")
 
 # COMMAND ----------
@@ -245,6 +283,8 @@ audit_df = spark.createDataFrame(
     audit_rows,
     [
         "target_table",
+        "source_system",
+        "dataset_name",
         "source_paths",
         "row_count",
         "write_mode",
@@ -252,4 +292,14 @@ audit_df = spark.createDataFrame(
     ],
 )
 
+(
+    audit_df.write.format("delta")
+    .mode("append")
+    .option("mergeSchema", "true")
+    .saveAsTable(AUDIT_TABLE_NAME)
+)
+
 audit_df.orderBy("target_table").show(truncate=False)
+
+# COMMAND ----------
+spark.sql(f"SHOW TABLES IN {BRONZE_NAMESPACE}").show(truncate=False)
